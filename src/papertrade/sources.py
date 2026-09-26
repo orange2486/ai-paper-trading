@@ -309,10 +309,29 @@ def fetch_exrights(fx: Fetcher, d: dt.date) -> dict:
                     {"startDate": f"{d:%Y%m%d}", "endDate": f"{d:%Y%m%d}", "response": "json"})
 
 
-def parse_exrights(body: dict) -> dict[str, float]:
-    """{code: 每股權值＋息值}。除權部分以價值近似入帳為現金（計畫書第 4 節附註）。"""
+def parse_exrights(body: dict) -> set[str]:
+    """當日除權息（含除權、除息、權息）的代號。"""
     if body.get("stat") != "OK" or not body.get("data"):
-        return {}
-    f = body["fields"]
-    ic, iv = f.index("股票代號"), f.index("權值+息值")
-    return {r[ic].strip(): num(r[iv]) or 0.0 for r in body["data"]}
+        return set()
+    ic = body["fields"].index("股票代號")
+    return {r[ic].strip() for r in body["data"]}
+
+
+def fetch_exright_detail(fx: Fetcher, d: dt.date, code: str) -> dict:
+    return fx.fetch(f"{d}", f"exright_{code}", f"{TWSE}/exRight/TWT49UDetail",
+                    {"STK_NO": code, "T1": f"{d:%Y%m%d}", "response": "json"})
+
+
+def parse_exright_detail(body: dict) -> dict:
+    """{"cash": 每股現金股利, "stock_per_1000": 每千股無償配股}。"""
+    if str(body.get("stat", "")).lower() != "ok" or not body.get("data"):
+        raise SourceError(f"TWT49UDetail 無資料：{body.get('stat')}")
+    f, r = body["fields"], body["data"][0]
+
+    def val(prefix: str) -> float:
+        for i, name in enumerate(f):
+            if name.strip().startswith(prefix) or prefix in name:
+                return num(str(r[i]).replace("元／股", "").replace("股", "")) or 0.0
+        raise SourceError(f"TWT49UDetail 找不到欄位 {prefix}: {f}")
+
+    return {"cash": val("(每股配發現金股利)"), "stock_per_1000": val("每千股無償配股")}

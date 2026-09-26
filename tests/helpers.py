@@ -63,7 +63,12 @@ class FakeFetcher:
             d = dt.datetime.strptime(p["startDate"], "%Y%m%d").date()
             rows = self.exrights.get(d, {})
             return {"stat": "OK", "fields": ["資料日期", "股票代號", "權值+息值"],
-                    "data": [["", c, str(v)] for c, v in rows.items()]} if rows else {"stat": "no"}
+                    "data": [["", c, "0"] for c in rows]} if rows else {"stat": "no"}
+        if url.endswith("TWT49UDetail"):  # exrights: {date: {code: (每股現金, 每千股配股)}}
+            d = dt.datetime.strptime(p["T1"], "%Y%m%d").date()
+            cash, stock = self.exrights[d][p["STK_NO"]]
+            return {"stat": "ok", "fields": ["股票代號", "(每股配發現金股利)除息", "A. 按普通股股東持股比例每千股無償配股"],
+                    "data": [[p["STK_NO"], f"{cash} 元／股", f"{stock} 股"]]}
         if "yuantaetfs" in url:  # date＝公告日；trandate＝其前一個有行情的交易日
             ann = dt.datetime.strptime(p["date"], "%Y%m%d").date()
             trade = max(d for d in self.quotes if d < ann)

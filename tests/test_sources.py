@@ -56,3 +56,19 @@ def test_parse_news_index_and_pcf_and_holidays():
 
     hol = sources.parse_holidays({"data": [["2026-01-01", "開國紀念日", ""], ["2026-01-02", "國曆新年開始交易日", ""]]})
     assert hol == {dt.date(2026, 1, 1)}
+
+
+def test_parse_exright_detail_real_format():
+    body = {"stat": "ok", "fields": ["股票代號", "股票名稱", "(每股配發現金股利)除息", "(增資配股) 除權",
+                                     "A. 按普通股股東持股比例每千股無償配股", "B. 員工紅利轉增資", "C. (有償) 現金增資",
+                                     "每股認購金額", "a. 公開承銷", "b. 員工認購", " c. 原股東認購", "按股東持股比例每千股認購"],
+            "data": [["6669  ", "緯穎", "0 元／股", "", "1,982.8 股", "0 股", "0 股", "0 元／股", "0 股", "0 股", "0 股",
+                      "0.00000000 股"]]}
+    assert sources.parse_exright_detail(body) == {"cash": 0.0, "stock_per_1000": 1982.8}
+    body["data"][0][2], body["data"][0][4] = "5.5 元／股", ""
+    assert sources.parse_exright_detail(body) == {"cash": 5.5, "stock_per_1000": 0.0}
+
+
+def test_parse_exrights_codes():
+    body = {"stat": "OK", "fields": ["資料日期", "股票代號", "權值+息值"], "data": [["", "2330 ", "5"]]}
+    assert sources.parse_exrights(body) == {"2330"}

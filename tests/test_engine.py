@@ -95,7 +95,7 @@ def test_dividend_credited_as_cash():
     st, trades, tid = _state_with_buy()
     engine.run_session(st, D1, {"2317": q("2317", 100, 100)}, {}, trades)
     cash = st["cash"]
-    engine.run_session(st, D2, {"2317": q("2317", 95, 95, ref=95)}, {"2317": 5.0}, trades)
+    engine.run_session(st, D2, {"2317": q("2317", 95, 95, ref=95)}, {"2317": {"cash": 5.0, "stock_per_1000": 0}}, trades)
     assert st["cash"] == cash + 500
     assert trades[tid]["dividends"][0]["amount"] == 500
 
@@ -114,3 +114,37 @@ def test_split_like_jump_does_not_trigger_stop_and_alerts():
     assert st["positions"]["6669"]["trigger"] is None
     assert any(e["type"] == "corporate_action_suspect" for e in ev)
     assert st["alerts"][0]["code"] == "6669"
+
+
+def test_ex_dividend_day_skips_stop_only_that_day():
+    st, trades, _ = _state_with_buy()
+    engine.run_session(st, D1, {"2317": q("2317", 100, 100)}, {}, trades)   # 停損 92.46
+    engine.run_session(st, D2, {"2317": q("2317", 90, 91, ref=90)}, {"2317": {"cash": 10.0, "stock_per_1000": 0}}, trades)
+    assert st["positions"]["2317"]["trigger"] is None                       # 除息日不判斷
+    assert st["positions"]["2317"]["stop"] == 92.46                         # 現金股利不調整停損
+    engine.run_session(st, D3, {"2317": q("2317", 91, 91, ref=91)}, {}, trades)
+    assert st["positions"]["2317"]["trigger"]["kind"] == "stop"             # 隔天照常判斷
+
+
+def test_stock_dividend_scales_shares_entry_and_stop():
+    st, trades, tid = _state_with_buy(code="6669", shares=10)
+    engine.run_session(st, D1, {"6669": q("6669", 7000, 7800)}, {}, trades)
+    entry, stop, cash = st["positions"]["6669"]["entry_price"], st["positions"]["6669"]["stop"], st["cash"]
+    ev = engine.run_session(st, D2, {"6669": q("6669", 2790, 2610, ref=2610)},
+                            {"6669": {"cash": 0.0, "stock_per_1000": 1982.8}}, trades)
+    pos = st["positions"]["6669"]
+    exact = 10 * 2.9828
+    assert pos["shares"] == 29                                   # 29.828 → 29 股
+    assert st["cash"] == round(cash + round(0.828 * 10, 2), 2)   # 不足 1 股以面額折現
+    f = 10 / exact
+    assert pos["entry_price"] == round(entry * f, 4) and pos["stop"] == round(stop * f, 2)
+    assert pos["trigger"] is None and "alerts" not in st         # 不是「疑似分割」
+    assert any(e["type"] == "stock_dividend" for e in ev)
+    assert trades[tid]["adjustments"][0]["shares_after"] == 29
+
+
+def test_exright_detail_fetch_failure_alerts():
+    st, trades, _ = _state_with_buy()
+    engine.run_session(st, D1, {"2317": q("2317", 100, 100)}, {}, trades)
+    engine.run_session(st, D2, {"2317": q("2317", 80, 80, ref=80)}, {"2317": {"error": "x"}}, trades)
+    assert st["positions"]["2317"]["trigger"] is None and st["alerts"]

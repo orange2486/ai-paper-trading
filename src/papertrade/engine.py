@@ -88,9 +88,13 @@ def _ref_price(q: dict, prev_close: float | None) -> float | None:
     return q.get("ref") if q.get("ref") is not None else prev_close
 
 
-def run_session(state: dict, d: dt.date, quotes: dict, exrights: dict[str, float],
+def run_session(state: dict, d: dt.date, quotes: dict, exrights: dict[str, dict],
                 trades: dict[str, dict], late_sessions: int = 0) -> list[dict]:
-    """結算交易日 d。會修改 state 與 trades（trade_id -> 交易紀錄）。回傳事件列表。"""
+    """結算交易日 d。會修改 state 與 trades（trade_id -> 交易紀錄）。回傳事件列表。
+
+    exrights：當日除權息的持股 {code: {"cash": 每股現金股利, "stock_per_1000": 每千股配股}}，
+    明細抓不到時為 {code: {"error": 原因}}。
+    """
     ev: list[dict] = []
     ds = d.isoformat()
     due = [o for o in state["orders"] if o["decision_date"] < ds]
@@ -197,16 +201,54 @@ def run_session(state: dict, d: dt.date, quotes: dict, exrights: dict[str, float
                        "shares": b["shares"], "price": px})
             b.update(shares=0, pending_sell=False, closed=True)
 
-    # 3) 除權息：權值＋息值 × 股數 以現金入帳（近似）
+    # 3) 除權息（PLAN v1.1）：現金股利入帳；股票股利改股數，成交價與停損等比例換算；當天不判斷停損
+    ex_today: set[str] = set()
     for code, pos in state["positions"].items():
-        if code in exrights and exrights[code] > 0:
-            amt = round(exrights[code] * pos["shares"], 2)
-            state["cash"] = round(state["cash"] + amt, 2)
-            trades[pos["trade_id"]].setdefault("dividends", []).append(
-                {"date": ds, "per_share": exrights[code], "amount": amt})
-            ev.append({"type": "dividend", "date": ds, "code": code, "amount": amt})
-    if b["shares"] > 0 and exrights.get(b["code"], 0) > 0:
-        amt = round(exrights[b["code"]] * b["shares"], 2)
+        if code not in exrights:
+            continue
+        ex_today.add(code)
+        info = exrights[code]
+        if "error" in info:
+            state.setdefault("alerts", []).append(
+                {"date": ds, "code": code, "prev_close": pos["last_close"], "close": None,
+                 "msg": f"除權息明細抓取失敗（{info['error']}），股利與股數需人工處理"})
+            ev.append({"type": "corporate_action_suspect", "date": ds, "code": code,
+                       "why": "除權息明細抓取失敗"})
+            continue
+        t = trades[pos["trade_id"]]
+        cash_amt = round(info["cash"] * pos["shares"], 2)
+        if cash_amt:
+            state["cash"] = round(state["cash"] + cash_amt, 2)
+            t.setdefault("dividends", []).append({"date": ds, "per_share": info["cash"], "amount": cash_amt})
+            ev.append({"type": "dividend", "date": ds, "code": code, "amount": cash_amt})
+        if info["stock_per_1000"]:
+            old_sh = pos["shares"]
+            exact = old_sh * (1 + info["stock_per_1000"] / 1000)
+            new_sh = int(exact + 1e-9)
+            frac_cash = round((exact - new_sh) * 10, 2)  # 不足 1 股以面額 10 元折現
+            f = old_sh / exact
+            pos.update(shares=new_sh, entry_price=round(pos["entry_price"] * f, 4),
+                       stop=round(pos["stop"] * f, 2),
+                       last_close=round(pos["last_close"] * f, 4) if pos["last_close"] else None)
+            if frac_cash:
+                state["cash"] = round(state["cash"] + frac_cash, 2)
+                t.setdefault("dividends", []).append({"date": ds, "per_share": 0, "amount": frac_cash,
+                                                      "note": "配股不足 1 股折現"})
+            t.setdefault("stop_history", []).append(
+                {"date": ds, "stop": pos["stop"],
+                 "why": f"股票股利每千股 {info['stock_per_1000']} 股：股數 {old_sh}→{new_sh}，停損等比例換算（×{f:.6f}）"})
+            t.setdefault("adjustments", []).append(
+                {"date": ds, "stock_per_1000": info["stock_per_1000"], "shares_before": old_sh,
+                 "shares_after": new_sh, "factor": round(f, 8)})
+            ev.append({"type": "stock_dividend", "date": ds, "code": code, "shares": new_sh - old_sh,
+                       "why": f"每千股 {info['stock_per_1000']} 股"})
+    bx = exrights.get(b["code"])
+    if b["shares"] > 0 and bx and "error" not in bx:
+        amt = round(bx["cash"] * b["shares"], 2)
+        if bx["stock_per_1000"]:
+            exact = b["shares"] * (1 + bx["stock_per_1000"] / 1000)
+            amt += round((exact - int(exact + 1e-9)) * 10, 2)
+            b["shares"] = int(exact + 1e-9)
         b["cash"] = round(b["cash"] + amt, 2)
         ev.append({"type": "bench_dividend", "date": ds, "amount": amt})
 
@@ -217,20 +259,20 @@ def run_session(state: dict, d: dt.date, quotes: dict, exrights: dict[str, float
         close = q.get("close") if q else None
         prev = pos["last_close"]
         suspect = (close is not None and prev and abs(close / prev - 1) > CA_JUMP
-                   and pos["entry_date"] != ds)
+                   and pos["entry_date"] != ds and code not in ex_today)
         if close is not None:
             pos["last_close"] = close
         pos["sessions_held"] += 1
         if suspect:
-            # 超過漲跌幅限制的跳動＝除權、分割或面額變更。股數沒調整前不判斷停損，要人工處理。
+            # 超過漲跌幅限制、又不在除權息表上的跳動＝分割、面額變更或減資。不判斷停損，要人工處理。
             state.setdefault("alerts", []).append(
                 {"date": ds, "code": code, "prev_close": prev, "close": close,
-                 "msg": "疑似分割／面額變更／除權，股數與停損需人工調整"})
+                 "msg": "疑似分割／面額變更／減資，股數與停損需人工調整"})
             ev.append({"type": "corporate_action_suspect", "date": ds, "code": code,
                        "why": f"收盤 {prev} → {close}"})
             continue
         if pos["trigger"] is None:
-            if close is not None and close <= pos["stop"]:
+            if close is not None and close <= pos["stop"] and code not in ex_today:
                 pos["trigger"] = {"kind": "stop", "date": ds, "session_no": state["session_no"],
                                   "close": close}
             elif pos["sessions_held"] >= config.MAX_HOLD_SESSIONS:

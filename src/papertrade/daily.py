@@ -114,9 +114,15 @@ def prepare(store: Store, fx: Fetcher, now: dt.datetime, final: bool = False) ->
                 continue
             today_missing = True
             break
-        exr = {}
-        if state["positions"] or state["benchmark"]["shares"]:
-            exr = sources.parse_exrights(sources.fetch_exrights(fx, d)["body"])
+        exr: dict[str, dict] = {}
+        held = set(state["positions"]) | ({state["benchmark"]["code"]} if state["benchmark"]["shares"] else set())
+        if held:
+            for code in sources.parse_exrights(sources.fetch_exrights(fx, d)["body"]) & held:
+                try:
+                    exr[code] = sources.parse_exright_detail(
+                        sources.fetch_exright_detail(fx, d, code)["body"])
+                except SourceError as exc:
+                    exr[code] = {"error": str(exc)}
         late = 1 if d < today else 0
         events += engine.run_session(state, d, quotes, exr, trades, late_sessions=late)
         processed.append(d)

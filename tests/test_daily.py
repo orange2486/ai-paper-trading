@@ -97,3 +97,20 @@ def test_news_window_and_cutoff(tmp_path):
     assert [x["subject"] for x in news["items"]["2317"]] == ["董事會決議"]
     assert news["items"]["2317"][0]["body"] == "全文"
     assert store.load_state()["last_news_cutoff"].startswith("2026-10-05T20:00")
+
+
+def test_stock_dividend_through_daily_flow(tmp_path):
+    store, fx = setup(tmp_path, {D0: quotes(250, 250), D1: quotes(250, 250),
+                                 D2: quotes(210, 200, ref=208.33)})
+    fx.exrights = {D2: {"2317": (0.0, 200.0)}}   # 每千股配 200 股
+    daily.prepare(store, fx, dt.datetime(2026, 10, 5, 20, 0, tzinfo=TZ))
+    write_proposal(store, D0, buys=[BUY | {"data_as_of": D0.isoformat()}])
+    daily.finalize(store)
+    daily.prepare(store, fx, dt.datetime(2026, 10, 6, 20, 0, tzinfo=TZ))
+    write_proposal(store, D1, no_action_reason="觀望")
+    daily.finalize(store)
+    shares = store.load_state()["positions"]["2317"]["shares"]
+    daily.prepare(store, fx, dt.datetime(2026, 10, 7, 20, 0, tzinfo=TZ))
+    pos = store.load_state()["positions"]["2317"]
+    assert pos["shares"] == int(shares * 1.2) and pos["trigger"] is None
+    assert pos["stop"] == round(250.5 * 0.92 / 1.2, 2)

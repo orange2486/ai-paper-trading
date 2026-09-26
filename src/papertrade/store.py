@@ -22,7 +22,7 @@ CSV_COLUMNS = {
 }
 EVENT_FILE = {"order_created": "orders", "order_cancelled": "orders", "order_carried": "orders",
               "exit_triggered": "orders", "corporate_action_suspect": "orders", "fill": "fills", "bench_fill": "fills",
-              "dividend": "fills", "bench_dividend": "fills", "daily": "daily"}
+              "dividend": "fills", "stock_dividend": "fills", "bench_dividend": "fills", "daily": "daily"}
 
 
 class Store:
