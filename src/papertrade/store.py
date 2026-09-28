@@ -1,4 +1,4 @@
-"""檔案存取：state、交易紀錄、CSV 紀錄、解析後的價量／法人。"""
+"""檔案存取：state、交易紀錄、賣出盤、CSV 紀錄、解析後的價量／法人。"""
 
 from __future__ import annotations
 
@@ -15,8 +15,14 @@ CSV_COLUMNS = {
     "fills": ["date", "type", "side", "code", "shares", "open", "price", "cash_change", "amount",
               "order_id", "trade_id", "kind"],
     "daily": ["date", "cash", "positions_value", "equity", "n_positions", "gross",
-              "bench_equity", "late_sessions"],
+              "bench_equity", "late_sessions",
+              "shadow_pnl", "shadow_real_pnl", "shadow_n_early",
+              "panel_ai_pnl", "panel_formula_pnl", "panel_n_early"],
     "risk_log": ["date", "item", "code", "result", "reason"],
+    "shadow": ["date", "book", "type", "code", "trade_id", "decision", "reason", "shadow_stop",
+               "side", "shares", "open", "price", "kind", "pnl", "why"],
+    "sell_panel": ["date", "book", "type", "code", "trade_id", "decision", "reason",
+                   "side", "shares", "open", "price", "kind", "order_id", "pnl", "why"],
     "runs": ["run_at", "session_date", "on_time", "new_buys_allowed", "blocked_reasons",
              "sessions_processed", "notes"],
 }
@@ -60,6 +66,16 @@ class Store:
 
     def save_state(self, state: dict) -> None:
         self._dump(self.state_path, state)
+
+    @property
+    def panel_path(self) -> Path:
+        return self.ledger / "panel.json"
+
+    def load_panel(self) -> dict | None:
+        return json.loads(self.panel_path.read_text(encoding="utf-8")) if self.panel_path.exists() else None
+
+    def save_panel(self, panel: dict) -> None:
+        self._dump(self.panel_path, panel)
 
     def load_trades(self) -> dict[str, dict]:
         d = self.ledger / "trades"

@@ -114,3 +114,66 @@ def test_stock_dividend_through_daily_flow(tmp_path):
     pos = store.load_state()["positions"]["2317"]
     assert pos["shares"] == int(shares * 1.2) and pos["trigger"] is None
     assert pos["stop"] == round(250.5 * 0.92 / 1.2, 2)
+
+
+def _day(store, fx, d, **proposal):
+    daily.prepare(store, fx, dt.datetime(d.year, d.month, d.day, 20, 0, tzinfo=TZ))
+    write_proposal(store, d, **proposal)
+    return daily.finalize(store)
+
+
+def test_shadow_and_panel_early_sell(tmp_path):
+    D3 = dt.date(2026, 10, 8)
+    store, fx = setup(tmp_path, {D0: quotes(250, 250), D1: quotes(250, 250), D2: quotes(255, 255),
+                                 D3: quotes(255, 255)})
+    _day(store, fx, D0, buys=[BUY | {"data_as_of": D0.isoformat()}])
+    panel = store.load_panel()
+    assert panel["status"] == "started" and len(panel["state"]["orders"]) == len(PCF)
+
+    r = _day(store, fx, D1, no_action_reason="觀望",
+             shadow=[{"code": "2317", "decision": "賣", "reason": "量縮", "shadow_stop": 245}],
+             panel=[{"code": "2330", "decision": "賣", "reason": "x"},
+                    {"code": "2317", "decision": "不賣", "reason": "y"}])
+    panel = store.load_panel()
+    assert panel["state"]["positions"]["2330"]["shares"] == 4          # 10,000 / 2480
+    assert store.load_state()["benchmark"]["entry_date"] == D1.isoformat()
+    log = {(x["item"], x["code"]): x["result"] for x in r["log"]}
+    assert log[("shadow", "2317")] == "通過" and log[("panel_ai", "2454")] == "作廢"   # 2454 未填
+    assert "Prompt B-1" in store.briefing_path(D1).read_text(encoding="utf-8")
+
+    daily.prepare(store, fx, dt.datetime(2026, 10, 7, 20, 0, tzinfo=TZ))
+    st = store.load_state()
+    sh = st["shadow"]["positions"]["T0001"]
+    assert sh["status"] == "closed" and sh["exit"]["kind"] == "early" and sh["exit"]["price"] == 254.5
+    assert "2317" in st["positions"]                                   # 真帳不受影響
+    panel = store.load_panel()
+    assert panel["ai"]["positions"]["P-2330"]["exit"]["kind"] == "early"
+    assert "2330" in panel["state"]["positions"]                       # 公式基準仍持有
+    row = store.read_csv("daily")[-1]
+    assert float(row["shadow_pnl"]) != float(row["shadow_real_pnl"]) and row["shadow_n_early"] == "1"
+    assert any(x["type"] == "fill" for x in store.read_csv("shadow"))
+    assert any(x["kind"] == "early" for x in store.read_csv("sell_panel"))
+
+
+def test_shadow_follows_real_formula_exit(tmp_path):
+    D3 = dt.date(2026, 10, 8)
+    store, fx = setup(tmp_path, {D0: quotes(250, 250), D1: quotes(250, 250), D2: quotes(240, 225, ref=250),
+                                 D3: quotes(220, 222, ref=225)})
+    _day(store, fx, D0, buys=[BUY | {"data_as_of": D0.isoformat()}])
+    _day(store, fx, D1, no_action_reason="觀望", shadow=[{"code": "2317", "decision": "不賣", "reason": "x"}])
+    _day(store, fx, D2, no_action_reason="觀望")                      # 停損觸發；影子帳沒寫
+    daily.prepare(store, fx, dt.datetime(2026, 10, 8, 20, 0, tzinfo=TZ))
+    st = store.load_state()
+    t = store.load_trades()["T0001"]
+    sh = st["shadow"]["positions"]["T0001"]
+    assert t["exit"]["kind"] == "stop"
+    assert sh["exit"]["kind"] == "follow_real" and sh["exit"]["price"] == t["exit"]["price"]
+    assert sh["pnl"] == t["pnl"]
+    # 賣出盤公式基準同樣觸發停損，panel_ai 跟著出場
+    panel = store.load_panel()
+    assert panel["trades"]["P-2317"]["exit"]["kind"] == "stop"
+    assert panel["ai"]["positions"]["P-2317"]["exit"]["kind"] == "follow_real"
+    # 停損成交日當晚不得買回
+    write_proposal(store, D3, buys=[BUY | {"target_price": 300, "data_as_of": D3.isoformat()}])
+    r = daily.finalize(store)
+    assert "停損成交日" in [x for x in r["log"] if x["item"] == "buy"][0]["reason"]

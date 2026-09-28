@@ -1,8 +1,9 @@
-"""每日流程（PLAN.md 第 6 節）。
+"""每日流程（PLAN.md v1.2 第 9 節）：一個排程、四本帳一起跑。
 
-    prepare  : 抓資料 → 結算未結算的交易日（成交、除權息、出場觸發）→ 強制出場委託 → 抓重大訊息 → 寫簡報
-    (AI 讀簡報，寫 ledger/proposals/YYYY-MM-DD.json)
-    finalize : 風控檢查提案 → 委託、檢討入帳 → 寫紀錄
+    prepare  : 抓資料 → 結算未結算的交易日（真帳、影子帳、賣出盤：成交、除權息、出場觸發）
+               → 強制出場委託 → 抓重大訊息 → 寫簡報
+    (AI 讀簡報，寫 ledger/proposals/YYYY-MM-DD.json：Prompt A 買、Prompt B 影子帳／賣出盤賣不賣)
+    finalize : 風控檢查提案 → 真帳委託、檢討入帳；影子帳／賣出盤的早賣單 → 寫紀錄
 """
 
 from __future__ import annotations
@@ -10,18 +11,34 @@ from __future__ import annotations
 import datetime as dt
 import json
 
-from . import briefing, config, engine, risk, sources
+from . import books, briefing, config, engine, risk, sources
 from .sources import Fetcher, SourceError
 from .store import Store
 
 
 LESSONS_HEADER = """# lessons.md：提案前自問的檢查問題
 
-規則（PLAN.md 第 8 節）：只能寫「問題」，不能寫硬規則（例如「以後不准買 XX」）；
-每條要引用至少一筆交易編號；同類錯誤出現 2 次以上才加；最多 20 條；不影響風控。
+規則（PLAN.md 第 12 節）：只能寫「問題」，不能寫硬規則（例如「以後不准買 XX」）；
+每條要引用至少一筆真帳已結束的交易編號；同類錯誤出現 2 次以上才加；最多 20 條；不影響風控。
 
 （目前沒有）
 """
+
+
+PANEL_BOOKS = {"formula": "panel_formula_only", "ai": "panel_ai"}
+
+
+def prior_path(store: Store):
+    """prompt_prior.md 在 repo 根目錄，trial／live 共用；前進期凍結。"""
+    return store.root.parent / "prompt_prior.md"
+
+
+def prior_items(text: str) -> list[str]:
+    return [ln for ln in text.splitlines() if ln.lstrip().startswith(("- ", "* "))]
+
+
+def _panel_events(evs: list[dict], book: str) -> list[dict]:
+    return [{"book": book, **e} for e in evs if e["type"] != "daily"]
 
 
 def _holidays(fx: Fetcher, store: Store, year: int) -> set[dt.date]:
@@ -76,9 +93,13 @@ def init(store: Store, init_date: dt.date, capital: float = config.CAPITAL) -> d
     if store.state_path.exists():
         raise SystemExit(f"{store.state_path} 已存在，不能重新初始化")
     state = engine.new_state(init_date, capital)
+    state["shadow"] = books.new_early_book()
     # 初始化日前一天視為已結算，第一次 prepare 從 init_date 開始結算
     state["last_session"] = (init_date - dt.timedelta(days=1)).isoformat()
+    panel = books.new_panel(init_date)
+    panel["state"]["last_session"] = state["last_session"]
     store.save_state(state)
+    store.save_panel(panel)
     (store.root / "lessons.md").write_text(LESSONS_HEADER, encoding="utf-8")
     return state
 
@@ -86,7 +107,13 @@ def init(store: Store, init_date: dt.date, capital: float = config.CAPITAL) -> d
 def prepare(store: Store, fx: Fetcher, now: dt.datetime, final: bool = False) -> dict:
     state = store.load_state()
     trades = store.load_trades()
+    state.setdefault("shadow", books.new_early_book())
+    state.setdefault("alerts", [])
+    panel = store.load_panel() or books.new_panel(dt.date.fromisoformat(state["init_date"]))
+    pst = panel["state"]
     events: list[dict] = []
+    shadow_ev: list[dict] = []
+    panel_ev: list[dict] = []
     notes: list[str] = []
     today = now.date()
 
@@ -115,7 +142,8 @@ def prepare(store: Store, fx: Fetcher, now: dt.datetime, final: bool = False) ->
             today_missing = True
             break
         exr: dict[str, dict] = {}
-        held = set(state["positions"]) | ({state["benchmark"]["code"]} if state["benchmark"]["shares"] else set())
+        held = (set(state["positions"]) | set(pst["positions"])
+                | ({state["benchmark"]["code"]} if state["benchmark"]["shares"] else set()))
         if held:
             for code in sources.parse_exrights(sources.fetch_exrights(fx, d)["body"]) & held:
                 try:
@@ -124,7 +152,21 @@ def prepare(store: Store, fx: Fetcher, now: dt.datetime, final: bool = False) ->
                 except SourceError as exc:
                     exr[code] = {"error": str(exc)}
         late = 1 if d < today else 0
-        events += engine.run_session(state, d, quotes, exr, trades, late_sessions=late)
+        # 早賣帳先在開盤成交（基準帳部位還在），再結算基準帳，最後跟著基準帳出場
+        shadow_ev += books.pre_session(state["shadow"], state, trades, d, quotes, "shadow")
+        panel_ev += books.pre_session(panel["ai"], pst, panel["trades"], d, quotes, PANEL_BOOKS["ai"])
+        sev = engine.run_session(state, d, quotes, exr, trades, late_sessions=late)
+        panel_ev += _panel_events(engine.run_session(pst, d, quotes, exr, panel["trades"], max_positions=None),
+                                  PANEL_BOOKS["formula"])
+        shadow_ev += books.post_session(state["shadow"], trades, d, "shadow")
+        panel_ev += books.post_session(panel["ai"], panel["trades"], d, PANEL_BOOKS["ai"])
+        sh = books.summary(state["shadow"], state, trades, quotes)
+        pn = books.summary(panel["ai"], pst, panel["trades"], quotes)
+        for e in sev:
+            if e["type"] == "daily":
+                e.update(shadow_pnl=sh["early_pnl"], shadow_real_pnl=sh["base_pnl"], shadow_n_early=sh["n_early"],
+                         panel_ai_pnl=pn["early_pnl"], panel_formula_pnl=pn["base_pnl"], panel_n_early=pn["n_early"])
+        events += sev
         processed.append(d)
         d += dt.timedelta(days=1)
 
@@ -139,8 +181,15 @@ def prepare(store: Store, fx: Fetcher, now: dt.datetime, final: bool = False) ->
                 "blocked": [], "notes": notes, "events": []}
 
     session = dt.date.fromisoformat(state["last_session"])
-    for al in state.get("alerts", []):
-        notes.append(f"【需人工處理】{al['date']} {al['code']}：{al['msg']}（{al['prev_close']} → {al['close']}）")
+    for book, st in (("真帳", state), ("賣出盤", pst)):
+        for al in st.get("alerts", []):
+            left = config.CORP_ACTION_GRACE_SESSIONS - (st["session_no"] - al.get("session_no", st["session_no"]))
+            notes.append(f"【需人工處理｜{book}】{al['date']} {al['code']}：{al['msg']}"
+                         f"（{al['prev_close']} → {al['close']}）；"
+                         + ("已逾期，下一開盤出清" if left <= 0 else f"再 {left} 個交易日沒處理就出清"))
+    n_prior = len(prior_items(prior_path(store).read_text(encoding="utf-8"))) if prior_path(store).exists() else 0
+    if n_prior > config.MAX_PRIOR_ITEMS:
+        notes.append(f"【違規】prompt_prior.md 有 {n_prior} 條，超過 {config.MAX_PRIOR_ITEMS} 條")
     blocked: list[str] = []
     on_time = bool(processed) and processed[-1] == today and now.time() >= config.ON_TIME_FROM
     if today_missing:
@@ -211,8 +260,16 @@ def prepare(store: Store, fx: Fetcher, now: dt.datetime, final: bool = False) ->
         order_date = today
     if final:
         state["final"] = True
+        pst["final"] = True
         blocked.append("期末結算")
     events += engine.place_forced_exits(state, order_date, pcf_codes)
+
+    # 6) 賣出盤：第一次拿到當日 PCF 的那晚，每檔下 1 萬元買單；之後只有公式出場
+    if panel["status"] == "not_started" and pcf_codes and not final:
+        panel_ev += books.start_panel(panel, pcf["constituents"], order_date)
+        if state["benchmark"]["entry_date"] is not None:
+            notes.append("賣出盤晚於對照組 0050 進場（第一晚沒有 PCF 或漏跑）")
+    panel_ev += _panel_events(engine.place_forced_exits(pst, order_date, pcf_codes), PANEL_BOOKS["formula"])
 
     new_buys_allowed = not blocked
     day = {"date": session.isoformat(), "order_date": order_date.isoformat(),
@@ -222,12 +279,16 @@ def prepare(store: Store, fx: Fetcher, now: dt.datetime, final: bool = False) ->
     state["day"] = day
 
     store.append_events(events)
+    store.append("shadow", shadow_ev)
+    store.append("sell_panel", panel_ev)
     store.append("runs", [{"run_at": day["run_at"], "session_date": day["date"], "on_time": on_time,
                            "new_buys_allowed": new_buys_allowed, "blocked_reasons": "；".join(blocked),
                            "sessions_processed": len(processed), "notes": "；".join(notes)}])
     store.save_trades(trades)
     store.save_state(state)
-    text = briefing.render(store, state, trades, session, constituents, news, day)
+    store.save_panel(panel)
+    prior = prior_path(store).read_text(encoding="utf-8") if prior_path(store).exists() else ""
+    text = briefing.render(store, state, trades, panel, session, constituents, news, day, prior)
     if notes:
         text = text.replace("\n## 帳戶", "\n- 註記：" + "；".join(notes) + "\n\n## 帳戶", 1)
     p = store.briefing_path(session)
@@ -241,6 +302,8 @@ def prepare(store: Store, fx: Fetcher, now: dt.datetime, final: bool = False) ->
 def finalize(store: Store) -> dict:
     state = store.load_state()
     trades = store.load_trades()
+    state.setdefault("shadow", books.new_early_book())
+    panel = store.load_panel() or books.new_panel(dt.date.fromisoformat(state["init_date"]))
     day = state.get("day")
     if not day or day.get("status") != "awaiting_proposal":
         raise SystemExit("沒有等待提案的交易日（先跑 prepare）")
@@ -259,9 +322,21 @@ def finalize(store: Store) -> dict:
     if not p.exists():
         log.append({"date": session.isoformat(), "item": "proposal", "code": "", "result": "作廢",
                     "reason": "沒有提案檔"})
+    # Prompt B：影子帳、賣出盤的「賣／不賣」（日期不對＝整份作廢，全部視為不賣）
+    ok = proposal.get("date") == session.isoformat()
+    ds = session.isoformat()
+    lg, shadow_ev = books.decide(state["shadow"], proposal.get("shadow") if ok else None, order_date, ds,
+                                 "shadow", allow_shadow_stop=True)
+    log += lg
+    lg, panel_ev = books.decide(panel["ai"], proposal.get("panel") if ok else None, order_date, ds,
+                                PANEL_BOOKS["ai"])
+    log += lg
     day["status"] = "done"
     store.append("risk_log", log)
     store.append_events(events)
+    store.append("shadow", shadow_ev)
+    store.append("sell_panel", panel_ev)
     store.save_trades(trades)
     store.save_state(state)
+    store.save_panel(panel)
     return {"session": session, "log": log, "events": events}

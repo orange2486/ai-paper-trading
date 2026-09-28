@@ -138,7 +138,7 @@ def test_stock_dividend_scales_shares_entry_and_stop():
     assert st["cash"] == round(cash + round(0.828 * 10, 2), 2)   # 不足 1 股以面額折現
     f = 10 / exact
     assert pos["entry_price"] == round(entry * f, 4) and pos["stop"] == round(stop * f, 2)
-    assert pos["trigger"] is None and "alerts" not in st         # 不是「疑似分割」
+    assert pos["trigger"] is None and not st["alerts"]          # 不是「疑似分割」
     assert any(e["type"] == "stock_dividend" for e in ev)
     assert trades[tid]["adjustments"][0]["shares_after"] == 29
 
@@ -148,3 +148,41 @@ def test_exright_detail_fetch_failure_alerts():
     engine.run_session(st, D1, {"2317": q("2317", 100, 100)}, {}, trades)
     engine.run_session(st, D2, {"2317": q("2317", 80, 80, ref=80)}, {"2317": {"error": "x"}}, trades)
     assert st["positions"]["2317"]["trigger"] is None and st["alerts"]
+
+
+def test_unhandled_alert_liquidates_after_3_sessions():
+    st, trades, tid = _state_with_buy(code="6669", shares=10, open_=7000)
+    engine.run_session(st, D1, {"6669": q("6669", 7000, 7000)}, {}, trades)
+    engine.run_session(st, D2, {"6669": q("6669", 2400, 2350, ref=2333)}, {}, trades)   # alert（第 2 個交易日）
+    d = D3
+    for _ in range(2):                                   # 第 3、4 個交易日：還在寬限期
+        engine.run_session(st, d, {"6669": q("6669", 2350, 2350)}, {}, trades)
+        assert engine.place_forced_exits(st, d, {"6669"}) == []
+        d += dt.timedelta(days=1)
+    engine.run_session(st, d, {"6669": q("6669", 2350, 2350)}, {}, trades)   # 第 5 個交易日仍未處理
+    engine.place_forced_exits(st, d, {"6669"})
+    assert st["orders"][0]["kind"] == "corp_action_unhandled"
+    engine.run_session(st, d + dt.timedelta(days=1), {"6669": q("6669", 2350, 2350)}, {}, trades)
+    assert trades[tid]["exit"]["kind"] == "corp_action_unhandled" and st["alerts"] == []
+
+
+def test_handled_alert_is_not_liquidated():
+    st, trades, _ = _state_with_buy(code="6669", shares=10, open_=7000)
+    engine.run_session(st, D1, {"6669": q("6669", 7000, 7000)}, {}, trades)
+    engine.run_session(st, D2, {"6669": q("6669", 2400, 2350, ref=2333)}, {}, trades)
+    st["alerts"] = []                                    # 人工處理完：停損也等比例換算
+    st["positions"]["6669"]["stop"] = round(st["positions"]["6669"]["stop"] / 3, 2)
+    d = D3
+    for _ in range(5):
+        engine.run_session(st, d, {"6669": q("6669", 2350, 2350)}, {}, trades)
+        d += dt.timedelta(days=1)
+    assert engine.place_forced_exits(st, d, {"6669"}) == []
+
+
+def test_budget_order_buys_one_share_when_price_above_budget():
+    st = engine.new_state(D0, capital=0)
+    trades = {"P-9999": {"trade_id": "P-9999", "code": "9999", "status": "ordered", "dividends": []}}
+    engine.add_order(st, [], decision_date=D0, side="buy", code="9999", shares=0, kind="panel",
+                     trade_id="P-9999", budget=10_000)
+    engine.run_session(st, D1, {"9999": q("9999", 12_000, 12_000)}, {}, trades, max_positions=None)
+    assert st["positions"]["9999"]["shares"] == 1

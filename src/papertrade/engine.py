@@ -1,7 +1,8 @@
-"""帳本與逐日結算（PLAN.md 第 3、4、6 節）。
+"""帳本與逐日結算（PLAN.md v1.2 第 3、4 節）。
 
 一個「session」＝一個交易日：開盤撮合前一次的委託 → 除權息入帳 → 收盤評價與出場觸發。
 這裡只做機械規則，不讀任何文字理由；AI 的提案由 risk.py 檢查後才變成委託。
+真帳與賣出盤的公式基準（books.py）共用這套引擎。
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ def new_state(init_date: dt.date, capital: float = config.CAPITAL) -> dict:
         "last_session": None,        # 最後結算的交易日
         "session_no": 0,             # 已結算的交易日數
         "last_news_cutoff": None,    # 上一次抓重大訊息的截止時間
+        "alerts": [],                # 公司行動待人工處理（處理完從這裡刪掉）
         "positions": {},             # code -> position
         "orders": [],                # 待成交委託
         "next_trade": 1,
@@ -38,10 +40,14 @@ def new_state(init_date: dt.date, capital: float = config.CAPITAL) -> dict:
 # ---------------------------------------------------------------- 委託
 
 def add_order(state: dict, events: list, *, decision_date: dt.date, side: str, code: str,
-              shares: int, kind: str, trade_id: str, delay_sessions: int = 0) -> dict:
+              shares: int, kind: str, trade_id: str, delay_sessions: int = 0,
+              budget: float | None = None) -> dict:
+    """budget：以成交當天開盤價買 budget 元（買不到 1 股則買 1 股），給賣出盤用；shares 此時忽略。"""
     o = {"order_id": f"O{state['next_order']:05d}", "decision_date": decision_date.isoformat(),
          "side": side, "code": code, "shares": int(shares), "kind": kind,
          "trade_id": trade_id, "delay_sessions": delay_sessions}
+    if budget is not None:
+        o["budget"] = budget
     state["next_order"] += 1
     state["orders"].append(o)
     events.append({"type": "order_created", "date": decision_date.isoformat(), **o})
@@ -89,14 +95,17 @@ def _ref_price(q: dict, prev_close: float | None) -> float | None:
 
 
 def run_session(state: dict, d: dt.date, quotes: dict, exrights: dict[str, dict],
-                trades: dict[str, dict], late_sessions: int = 0) -> list[dict]:
+                trades: dict[str, dict], late_sessions: int = 0,
+                max_positions: int | None = config.MAX_POSITIONS) -> list[dict]:
     """結算交易日 d。會修改 state 與 trades（trade_id -> 交易紀錄）。回傳事件列表。
 
     exrights：當日除權息的持股 {code: {"cash": 每股現金股利, "stock_per_1000": 每千股配股}}，
     明細抓不到時為 {code: {"error": 原因}}。
+    max_positions：None＝不限檔數（賣出盤）。
     """
     ev: list[dict] = []
     ds = d.isoformat()
+    sn = state["session_no"] + 1  # 本交易日的序號
     due = [o for o in state["orders"] if o["decision_date"] < ds]
     keep = [o for o in state["orders"] if o["decision_date"] >= ds]
 
@@ -116,12 +125,9 @@ def run_session(state: dict, d: dt.date, quotes: dict, exrights: dict[str, dict]
                 _, lim_dn = costs.limit_prices(_ref_price(q, pos["last_close"]) or op, o["code"])
                 if op <= lim_dn:
                     why = "開盤跌停，不成交"
-            if why:
-                if o["kind"] == "ai":
-                    ev.append({"type": "order_cancelled", "date": ds, **o, "why": why})
-                else:  # 強制出場：委託保留到下一個交易日開盤
-                    keep.append(o)
-                    ev.append({"type": "order_carried", "date": ds, **o, "why": why})
+            if why:  # v1.2 只剩強制出場：委託保留到下一個交易日開盤，直到成交
+                keep.append(o)
+                ev.append({"type": "order_carried", "date": ds, **o, "why": why})
                 continue
             px = costs.sell_fill_price(op, o["code"])
             proceeds = costs.sell_proceeds(px, pos["shares"], o["code"])
@@ -138,6 +144,8 @@ def run_session(state: dict, d: dt.date, quotes: dict, exrights: dict[str, dict]
             t["sessions_held"] = pos["sessions_held"]
             t["status"] = "closed"
             del state["positions"][o["code"]]
+            if state.get("alerts"):  # 出清後，該檔的公司行動提醒不再需要處理
+                state["alerts"] = [x for x in state["alerts"] if x["code"] != o["code"]]
             ev.append({"type": "fill", "date": ds, "side": "sell", "code": o["code"],
                        "shares": pos["shares"], "open": op, "price": px, "cash_change": proceeds,
                        "order_id": o["order_id"], "trade_id": t["trade_id"], "kind": o["kind"]})
@@ -153,12 +161,15 @@ def run_session(state: dict, d: dt.date, quotes: dict, exrights: dict[str, dict]
                     why = "開盤漲停，不成交、不追價"
             if why is None and o["code"] in state["positions"]:
                 why = "已持有同一檔"
-            if why is None and len(state["positions"]) >= config.MAX_POSITIONS:
-                why = "持股已滿 5 檔（同日賣單未成交）"
+            if why is None and max_positions is not None and len(state["positions"]) >= max_positions:
+                why = f"持股已滿 {max_positions} 檔（同日賣單未成交）"
             shares = 0
             if why is None:
                 px = costs.buy_fill_price(op, o["code"])
-                shares = min(o["shares"], costs.max_shares(state["cash"], px))
+                if o.get("budget"):
+                    shares = max(1, costs.max_shares(o["budget"], px))
+                else:
+                    shares = min(o["shares"], costs.max_shares(state["cash"], px))
                 if shares <= 0:
                     why = "現金不足"
             if why:
@@ -210,7 +221,7 @@ def run_session(state: dict, d: dt.date, quotes: dict, exrights: dict[str, dict]
         info = exrights[code]
         if "error" in info:
             state.setdefault("alerts", []).append(
-                {"date": ds, "code": code, "prev_close": pos["last_close"], "close": None,
+                {"date": ds, "session_no": sn, "code": code, "prev_close": pos["last_close"], "close": None,
                  "msg": f"除權息明細抓取失敗（{info['error']}），股利與股數需人工處理"})
             ev.append({"type": "corporate_action_suspect", "date": ds, "code": code,
                        "why": "除權息明細抓取失敗"})
@@ -253,7 +264,7 @@ def run_session(state: dict, d: dt.date, quotes: dict, exrights: dict[str, dict]
         ev.append({"type": "bench_dividend", "date": ds, "amount": amt})
 
     # 4) 收盤：評價、持有天數、停損／到期觸發
-    state["session_no"] += 1
+    state["session_no"] = sn
     for code, pos in state["positions"].items():
         q = quotes.get(code)
         close = q.get("close") if q else None
@@ -266,13 +277,15 @@ def run_session(state: dict, d: dt.date, quotes: dict, exrights: dict[str, dict]
         if suspect:
             # 超過漲跌幅限制、又不在除權息表上的跳動＝分割、面額變更或減資。不判斷停損，要人工處理。
             state.setdefault("alerts", []).append(
-                {"date": ds, "code": code, "prev_close": prev, "close": close,
+                {"date": ds, "session_no": sn, "code": code, "prev_close": prev, "close": close,
                  "msg": "疑似分割／面額變更／減資，股數與停損需人工調整"})
             ev.append({"type": "corporate_action_suspect", "date": ds, "code": code,
                        "why": f"收盤 {prev} → {close}"})
             continue
         if pos["trigger"] is None:
-            if close is not None and close <= pos["stop"] and code not in ex_today:
+            # 公司行動 alert 未處理期間，股數與停損都還沒換算，不判斷停損（到期照常）
+            alerted = any(x["code"] == code for x in state.get("alerts", []))
+            if close is not None and close <= pos["stop"] and code not in ex_today and not alerted:
                 pos["trigger"] = {"kind": "stop", "date": ds, "session_no": state["session_no"],
                                   "close": close}
             elif pos["sessions_held"] >= config.MAX_HOLD_SESSIONS:
@@ -283,11 +296,12 @@ def run_session(state: dict, d: dt.date, quotes: dict, exrights: dict[str, dict]
         b["last_close"] = bq["close"]
     state["last_session"] = ds
 
+    eq = equity(state, quotes)
     ev.append({"type": "daily", "date": ds, "cash": state["cash"],
-               "positions_value": round(equity(state, quotes) - state["cash"], 2),
-               "equity": equity(state, quotes),
+               "positions_value": round(eq - state["cash"], 2),
+               "equity": eq,
                "n_positions": len(state["positions"]),
-               "gross": round((equity(state, quotes) - state["cash"]) / equity(state, quotes), 4),
+               "gross": round((eq - state["cash"]) / eq, 4) if eq > 0 else None,
                "bench_equity": bench_equity(state),
                "late_sessions": late_sessions})
     return ev
@@ -295,10 +309,28 @@ def run_session(state: dict, d: dt.date, quotes: dict, exrights: dict[str, dict]
 
 # ---------------------------------------------------------------- 強制出場委託
 
+def overdue_alerts(state: dict) -> dict[str, dict]:
+    """持股的公司行動 alert 已連續 CORP_ACTION_GRACE_SESSIONS 個交易日沒處理 → {code: 最早的 alert}。
+
+    alert 在第 N 個交易日產生；第 N+3 個交易日結算後仍在 → 下一次開盤出清。
+    人工處理＝調整 state.json 的股數／停損後，把該筆 alert 刪掉。
+    """
+    out: dict[str, dict] = {}
+    for al in state.get("alerts", []):
+        sn = al.get("session_no")
+        if (al["code"] in state["positions"] and sn is not None
+                and state["session_no"] - sn >= config.CORP_ACTION_GRACE_SESSIONS
+                and al["code"] not in out):
+            out[al["code"]] = al
+    return out
+
+
 def place_forced_exits(state: dict, run_date: dt.date, pcf_codes: set[str] | None) -> list[dict]:
-    """停損／到期／剔除成分股／期末 → T+1 開盤賣單。記 delay_sessions（觸發到下單隔了幾個交易日）。"""
+    """停損／到期／剔除成分股／公司行動逾期未處理／期末 → T+1 開盤賣單。
+    記 delay_sessions（觸發到下單隔了幾個交易日）。"""
     ev: list[dict] = []
     pend = pending_sell_codes(state)
+    overdue = overdue_alerts(state)
     for code, pos in sorted(state["positions"].items()):
         if code in pend:
             continue
@@ -310,6 +342,8 @@ def place_forced_exits(state: dict, run_date: dt.date, pcf_codes: set[str] | Non
             delay = state["session_no"] - pos["trigger"]["session_no"]
         elif pcf_codes is not None and code not in pcf_codes:
             kind = "index_delete"
+        elif code in overdue:
+            kind = "corp_action_unhandled"
         if kind:
             add_order(state, ev, decision_date=run_date, side="sell", code=code,
                       shares=pos["shares"], kind=kind, trade_id=pos["trade_id"],

@@ -76,12 +76,12 @@ def _full_state():
     return st
 
 
-def test_max_five_positions_unless_selling_same_day():
+def test_max_five_positions_unless_forced_sell_same_day():
     _, _, log = run({"buys": [buy(amount=150_000)]}, state=_full_state())
     assert "5 檔" in results(log)[0][1]
-    trades = {f"T{i}": {"trade_id": f"T{i}"} for i in range(5)}
-    st, _, log = run({"sells": [{"code": "2881", "reason": "換股"}], "buys": [buy(amount=150_000)]},
-                     state=_full_state(), trades=trades)
+    st = _full_state()
+    engine.add_order(st, [], decision_date=D, side="sell", code="2881", shares=10, kind="stop", trade_id="T0")
+    _, _, log = run({"buys": [buy(amount=150_000)]}, state=st)
     assert results(log)[0][0] == "通過"
 
 
@@ -94,15 +94,26 @@ def test_cash_limit_keeps_gross_at_most_100():
     assert "現金不足" in results(log)[0][1]
 
 
-def test_stop_only_tightens():
+def test_ai_cannot_sell_or_change_stop():
     st = engine.new_state(D)
     st["positions"]["2317"] = {"trade_id": "T1", "shares": 10, "entry_price": 250, "entry_date": "x",
                                "stop": 230, "sessions_held": 1, "last_close": 250, "trigger": None}
     trades = {"T1": {"trade_id": "T1", "stop_history": []}}
-    _, _, log = run({"stop_updates": [{"code": "2317", "new_stop": 220, "why": "x"}]}, state=st, trades=trades)
-    assert results(log, "stop_update")[0][0] == "作廢" and st["positions"]["2317"]["stop"] == 230
-    _, _, log = run({"stop_updates": [{"code": "2317", "new_stop": 240, "why": "x"}]}, state=st, trades=trades)
-    assert results(log, "stop_update")[0][0] == "通過" and st["positions"]["2317"]["stop"] == 240
+    _, _, log = run({"sells": [{"code": "2317", "reason": "x"}],
+                     "stop_updates": [{"code": "2317", "new_stop": 240, "why": "x"}],
+                     "no_action_reason": "x"}, state=st, trades=trades)
+    assert results(log, "sell")[0][0] == "作廢" and results(log, "stop_update")[0][0] == "作廢"
+    assert st["orders"] == [] and st["positions"]["2317"]["stop"] == 230
+
+
+def test_no_rebuy_on_stop_fill_night():
+    trades = {"T1": {"trade_id": "T1", "code": "2317", "status": "closed",
+                     "exit": {"date": D.isoformat(), "kind": "stop"}}}
+    _, _, log = run({"buys": [buy("2317", target_price=300)]}, trades=trades)
+    assert "停損成交日" in results(log)[0][1]
+    trades["T1"]["exit"]["kind"] = "expiry"   # 到期出場不受此限
+    _, _, log = run({"buys": [buy("2317", target_price=300)]}, trades=trades)
+    assert results(log)[0][0] == "通過"
 
 
 def test_review_categories_and_once_only():
