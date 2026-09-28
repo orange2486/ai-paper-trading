@@ -186,3 +186,9 @@ def test_budget_order_buys_one_share_when_price_above_budget():
                      trade_id="P-9999", budget=10_000)
     engine.run_session(st, D1, {"9999": q("9999", 12_000, 12_000)}, {}, trades, max_positions=None)
     assert st["positions"]["9999"]["shares"] == 1
+
+
+def test_buying_on_ex_dividend_day_gets_no_dividend():
+    st, trades, tid = _state_with_buy()
+    engine.run_session(st, D1, {"2317": q("2317", 95, 95, ref=95)}, {"2317": {"cash": 5.0, "stock_per_1000": 0}}, trades)
+    assert trades[tid]["dividends"] == [] and st["positions"]["2317"]["shares"] == 100

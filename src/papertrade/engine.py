@@ -215,8 +215,8 @@ def run_session(state: dict, d: dt.date, quotes: dict, exrights: dict[str, dict]
     # 3) 除權息（PLAN v1.1）：現金股利入帳；股票股利改股數，成交價與停損等比例換算；當天不判斷停損
     ex_today: set[str] = set()
     for code, pos in state["positions"].items():
-        if code not in exrights:
-            continue
+        if code not in exrights or pos["entry_date"] == ds:
+            continue  # 除權息日當天開盤才買進的部位沒有配息配股的權利
         ex_today.add(code)
         info = exrights[code]
         if "error" in info:
