@@ -72,3 +72,15 @@ def test_parse_exright_detail_real_format():
 def test_parse_exrights_codes():
     body = {"stat": "OK", "fields": ["資料日期", "股票代號", "權值+息值"], "data": [["", "2330 ", "5"]]}
     assert sources.parse_exrights(body) == {"2330"}
+
+
+def test_fetcher_reuse_dir_reads_cached_raw(tmp_path):
+    import gzip, json
+    from papertrade.sources import Fetcher
+    src = tmp_path / "old" / "2026-07-01"
+    src.mkdir(parents=True)
+    with gzip.open(src / "quotes.json.gz", "wt", encoding="utf-8") as f:
+        json.dump({"url": "u", "params": {}, "fetched_at": "t", "body": {"x": 1}}, f)
+    fx = Fetcher(tmp_path / "new", reuse_dir=tmp_path / "old")
+    assert fx.fetch("2026-07-01", "quotes", "http://invalid", {})["body"] == {"x": 1}
+    assert (tmp_path / "new" / "2026-07-01" / "quotes.json.gz").exists()

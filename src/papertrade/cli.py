@@ -39,10 +39,15 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--from", dest="start", help="replay：第一個重播日")
     ap.add_argument("--to", dest="end", help="replay：最後一個重播日")
     ap.add_argument("--model", help="decide／replay：指定模型（預設用 CLI 預設模型）")
+    ap.add_argument("--reuse-raw", help="試跑用：先讀這個帳戶資料夾的 data/raw 原始檔，沒有才連網")
     a = ap.parse_args(argv)
 
     store = Store(ROOT / a.account)
     fx = Fetcher(store.raw_dir)
+    if a.reuse_raw:
+        if a.account == "live":
+            raise SystemExit("正式帳戶不准用 --reuse-raw")
+        fx.reuse_dir = ROOT / a.reuse_raw / "data" / "raw"
     if (a.now or a.command == "replay") and a.account == "live":
         raise SystemExit("正式帳戶不准用 --now 或 replay")
     now = (dt.datetime.fromisoformat(a.now).replace(tzinfo=config.TZ) if a.now

@@ -68,6 +68,7 @@ def num(s) -> float | None:
 class Fetcher:
     raw_dir: Path
     min_interval: float = 3.0
+    reuse_dir: Path | None = None  # 試跑重播用：這裡已有同名原始檔就直接讀，不連網
     _last: float = 0.0
 
     def _wait(self) -> None:
@@ -100,6 +101,15 @@ class Fetcher:
     def fetch(self, folder: str, name: str, url: str, params: dict,
               post_json: bool = False) -> dict:
         """抓取並存成 raw_dir/folder/name.json.gz；回傳 {url, params, fetched_at, body}。"""
+        if self.reuse_dir is not None:
+            cached = self.reuse_dir / folder / f"{name}.json.gz"
+            if cached.exists():
+                rec = load_raw(cached)
+                out = self.raw_dir / folder
+                out.mkdir(parents=True, exist_ok=True)
+                with gzip.open(out / f"{name}.json.gz", "wt", encoding="utf-8") as f:
+                    json.dump(rec, f, ensure_ascii=False)
+                return rec
         fetched_at = now_tw().isoformat(timespec="seconds")
         body = self.request(url, params, post_json)
         rec = {"url": url, "params": params, "fetched_at": fetched_at, "body": body}
