@@ -30,6 +30,13 @@ def open_positions(book: dict) -> dict[str, dict]:
     return {tid: p for tid, p in book["positions"].items() if p["status"] == "open"}
 
 
+def required_codes(book: dict, base_state: dict) -> list[str]:
+    """今晚必須寫「賣／不賣」的代號：未平倉、還沒寫過賣、基準帳也還沒有公式賣單（那些反正會跟著出場）。
+    簡報與 decide 共用這份清單，兩邊才不會不一致。"""
+    pend = engine.pending_sell_codes(base_state)
+    return sorted(p["code"] for p in open_positions(book).values() if not p.get("order") and p["code"] not in pend)
+
+
 def _ev(book_name: str, ds: str, typ: str, p: dict, **kw) -> dict:
     return {"date": ds, "book": book_name, "type": typ, "code": p["code"], "trade_id": p["trade_id"], **kw}
 
@@ -97,10 +104,11 @@ def post_session(book: dict, base_trades: dict, d: dt.date, book_name: str) -> l
     return ev
 
 
-def decide(book: dict, decisions: list | None, order_date: dt.date, ds: str, book_name: str,
+def decide(book: dict, base_state: dict, decisions: list | None, order_date: dt.date, ds: str, book_name: str,
            allow_shadow_stop: bool = False) -> tuple[list[dict], list[dict]]:
-    """Prompt B 的「賣／不賣」。回傳 (risk_log 列, 事件)。每檔未平倉、尚無賣單的部位都要寫一次。"""
-    todo = {p["code"]: p for p in open_positions(book).values() if not p.get("order")}
+    """Prompt B 的「賣／不賣」。回傳 (risk_log 列, 事件)。required_codes 裡的每一檔都要寫一次。"""
+    req = set(required_codes(book, base_state))
+    todo = {p["code"]: p for p in open_positions(book).values() if p["code"] in req}
     log: list[dict] = []
     ev: list[dict] = []
     seen: set[str] = set()
@@ -114,7 +122,7 @@ def decide(book: dict, decisions: list | None, order_date: dt.date, ds: str, boo
         dec = x.get("decision")
         reason = str(x.get("reason", "")).strip()
         if p is None:
-            log.append(row(code, False, "沒有未平倉、尚無賣單的部位"))
+            log.append(row(code, False, "不在今晚必須寫的清單（已平倉、已寫過賣，或基準帳已有公式賣單）"))
         elif code in seen:
             log.append(row(code, False, "同一檔寫了兩次，只採第一次"))
         elif dec not in config.SELL_DECISIONS:

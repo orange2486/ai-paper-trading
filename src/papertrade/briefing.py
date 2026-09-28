@@ -73,6 +73,7 @@ def _early_table(book: dict, base_state: dict, base_trades: dict, quotes: dict, 
     if not rows:
         return ["（無）"]
     pend = engine.pending_sell_codes(base_state)
+    need = set(books.required_codes(book, base_state))
     out = ["| 代號 | " + ("名稱 | " if with_name else "交易 | ") + "成交價 | 收盤 | 損益% | 公式停損 | 已持有 | 狀態 |",
            "|---|---|---|---|---|---|---|---|"]
     for p in rows:
@@ -84,12 +85,15 @@ def _early_table(book: dict, base_state: dict, base_trades: dict, quotes: dict, 
             status = "公式已下賣單"
         elif pos and pos["trigger"]:
             status = pos["trigger"]["kind"]
-        else:
+        elif p["code"] in need:
             status = "**要寫賣／不賣**"
+        else:
+            status = ""
         stop = pos["stop"] if pos else ""
         held = f"{pos['sessions_held']}/{config.MAX_HOLD_SESSIONS}" if pos else ""
         out.append(f"| {p['code']} | {p['name'] if with_name else p['trade_id']} | {p['entry_price']} | {px} | "
                    f"{_pct(px, p['entry_price'])} | {stop} | {held} | {status} |")
+    out += ["", f"**今晚必須寫的代號（{len(need)} 檔）**：" + ("、".join(sorted(need)) if need else "（無）")]
     return out
 
 

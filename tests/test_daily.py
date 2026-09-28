@@ -177,3 +177,19 @@ def test_shadow_follows_real_formula_exit(tmp_path):
     write_proposal(store, D3, buys=[BUY | {"target_price": 300, "data_as_of": D3.isoformat()}])
     r = daily.finalize(store)
     assert "停損成交日" in [x for x in r["log"] if x["item"] == "buy"][0]["reason"]
+
+
+def test_prompt_b_skips_positions_with_formula_sell(tmp_path):
+    D3 = dt.date(2026, 10, 8)
+    store, fx = setup(tmp_path, {D0: quotes(250, 250), D1: quotes(250, 250), D2: quotes(240, 225, ref=250),
+                                 D3: quotes(220, 222, ref=225)})
+    _day(store, fx, D0, buys=[BUY | {"data_as_of": D0.isoformat()}])
+    _day(store, fx, D1, no_action_reason="x", shadow=[{"code": "2317", "decision": "不賣", "reason": "x"}],
+         panel=[{"code": c, "decision": "不賣", "reason": "x"} for c in PCF])
+    # D2：2317 觸發停損，真帳與公式基準都已下賣單 → 今晚不必寫 2317
+    r = _day(store, fx, D2, no_action_reason="x", panel=[{"code": c, "decision": "不賣", "reason": "x"}
+                                                           for c in PCF if c != "2317"])
+    missing = [x for x in r["log"] if x["reason"].startswith("未填")]
+    assert missing == []
+    text = store.briefing_path(D2).read_text(encoding="utf-8")
+    assert "今晚必須寫的代號（0 檔）" in text and "今晚必須寫的代號（2 檔）" in text

@@ -325,10 +325,10 @@ def finalize(store: Store) -> dict:
     # Prompt B：影子帳、賣出盤的「賣／不賣」（日期不對＝整份作廢，全部視為不賣）
     ok = proposal.get("date") == session.isoformat()
     ds = session.isoformat()
-    lg, shadow_ev = books.decide(state["shadow"], proposal.get("shadow") if ok else None, order_date, ds,
+    lg, shadow_ev = books.decide(state["shadow"], state, proposal.get("shadow") if ok else None, order_date, ds,
                                  "shadow", allow_shadow_stop=True)
     log += lg
-    lg, panel_ev = books.decide(panel["ai"], proposal.get("panel") if ok else None, order_date, ds,
+    lg, panel_ev = books.decide(panel["ai"], panel["state"], proposal.get("panel") if ok else None, order_date, ds,
                                 PANEL_BOOKS["ai"])
     log += lg
     day["status"] = "done"
