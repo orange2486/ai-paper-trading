@@ -11,7 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 
-from . import books, briefing, config, engine, risk, sources
+from . import anon, books, briefing, config, engine, risk, sources
 from .sources import Fetcher, SourceError
 from .store import Store
 
@@ -23,6 +23,10 @@ LESSONS_HEADER = """# lessons.md：提案前自問的檢查問題
 
 （目前沒有）
 """
+
+
+class _SkipNews(Exception):
+    pass
 
 
 PANEL_BOOKS = {"formula": "panel_formula_only", "ai": "panel_ai"}
@@ -233,7 +237,11 @@ def prepare(store: Store, fx: Fetcher, now: dt.datetime, final: bool = False) ->
              if state["last_news_cutoff"] else dt.datetime.combine(session, dt.time(0), config.TZ))
     news = {"after": after.isoformat(timespec="seconds"), "until": now.isoformat(timespec="seconds"),
             "items": {}}
+    if state.get("no_news"):  # 試跑回測：不抓重大訊息（匿名回測與其對照組）
+        news["disabled"] = True
     try:
+        if state.get("no_news"):
+            raise _SkipNews
         idx = []
         nd = after.date()
         while nd <= today:
@@ -249,6 +257,8 @@ def prepare(store: Store, fx: Fetcher, now: dt.datetime, final: bool = False) ->
         news["items"] = chosen
         news["fetched_at"] = sources.now_tw().isoformat(timespec="seconds")
         state["last_news_cutoff"] = now.isoformat(timespec="seconds")
+    except _SkipNews:
+        pass
     except SourceError as exc:
         notes.append(f"重大訊息抓取失敗：{exc}（簡報不含重大訊息）")
         news["error"] = str(exc)
@@ -295,6 +305,10 @@ def prepare(store: Store, fx: Fetcher, now: dt.datetime, final: bool = False) ->
     p.parent.mkdir(parents=True, exist_ok=True)
     store.proposal_path(session).parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text, encoding="utf-8")
+    if state.get("anon"):
+        a = anon.render(store, state, trades, panel, session, constituents, day, prior)
+        p.with_name(f"{session}.anon.md").write_text(a, encoding="utf-8")
+        store.save_state(state)  # 新代號、指數基準要存下來
     return {"session": session, "briefing": p, "new_buys_allowed": new_buys_allowed,
             "blocked": blocked, "notes": notes, "events": events}
 

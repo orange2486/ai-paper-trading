@@ -14,16 +14,22 @@ def _pct(a: float | None, b: float | None) -> str:
     return f"{(a / b - 1) * 100:+.1f}"
 
 
-def stock_table(store: Store, d: dt.date, constituents: list[dict]) -> str:
+def _chg(a: float | None, b: float | None) -> float | None:
+    return None if a is None or b in (None, 0) else (a / b - 1) * 100
+
+
+def _fmt(x: float | None) -> str:
+    return "" if x is None else f"{x:+.1f}"
+
+
+def stock_metrics(store: Store, d: dt.date, constituents: list[dict]) -> tuple[list[dict], list[dt.date]]:
+    """每檔成分股的價量與法人指標（數值），給一般簡報與匿名簡報共用。"""
     dates = [x for x in store.price_dates() if x <= d][-61:]
     hist = {x: store.load_quotes(x) or {} for x in dates}
     inst_dates = [x for x in dates if store.load_institutional(x) is not None][-5:]
     inst = {x: store.load_institutional(x) for x in inst_dates}
     today_inst = inst.get(d)
-
-    lines = ["| 代號 | 名稱 | 權重% | 收盤 | 日% | 5日% | 20日% | 60日% | 距MA20% | 距MA60% | 量/20日均量 | 距60日高% | 外資(張) | 投信(張) | 法人5日(張) |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
-    flagged: list[str] = []
+    rows = []
     for c in constituents:
         code = c["code"]
         closes = [hist[x].get(code, {}).get("close") for x in dates]
@@ -43,23 +49,40 @@ def stock_table(store: Store, d: dt.date, constituents: list[dict]) -> str:
         if jump is not None:
             closes = [None] * jump + closes[jump:]
             vols = [None] * jump + vols[jump:]
-            flagged.append(f"{code}（{dates[jump]}）")
         valid = [x for x in closes if x is not None]
         ma20 = sum(valid[-20:]) / len(valid[-20:]) if len(valid) >= 20 else None
         ma60 = sum(valid[-60:]) / len(valid[-60:]) if len(valid) >= 60 else None
         vv = [v for v in vols[:-1][-20:] if v]
-        vol_ratio = f"{q['volume'] / (sum(vv) / len(vv)):.2f}" if vv and q.get("volume") else ""
-        hi60 = max(valid[-60:]) if valid else None
+        avgvol = sum(vv) / len(vv) if vv else None
         ti = (today_inst or {}).get(code) or {}
-        f_lots = f"{ti['foreign'] / 1000:,.0f}" if ti.get("foreign") is not None else ""
-        t_lots = f"{ti['trust'] / 1000:,.0f}" if ti.get("trust") is not None else ""
         tot5 = [inst[x].get(code, {}).get("total") for x in inst_dates]
-        tot5 = f"{sum(v for v in tot5 if v) / 1000:,.0f}" if any(tot5) else ""
-        chg1 = _pct(close, q.get("ref")) if q.get("ref") else _pct(close, back(1))
-        lines.append(f"| {code} | {c['name']} | {c.get('weight') or ''} | {close if close is not None else '--'} | "
-                     f"{chg1} | {_pct(close, back(5))} | {_pct(close, back(20))} | {_pct(close, back(60))} | "
-                     f"{_pct(close, ma20)} | {_pct(close, ma60)} | {vol_ratio} | {_pct(close, hi60)} | "
-                     f"{f_lots} | {t_lots} | {tot5} |")
+        rows.append({
+            "code": code, "name": c["name"], "weight": c.get("weight"), "close": close,
+            "chg1": _chg(close, q.get("ref")) if q.get("ref") else _chg(close, back(1)),
+            "r5": _chg(close, back(5)), "r20": _chg(close, back(20)), "r60": _chg(close, back(60)),
+            "dma20": _chg(close, ma20), "dma60": _chg(close, ma60),
+            "vol_ratio": q["volume"] / avgvol if avgvol and q.get("volume") else None, "avgvol": avgvol,
+            "dhi60": _chg(close, max(valid[-60:]) if valid else None),
+            "foreign": ti.get("foreign"), "trust": ti.get("trust"),
+            "tot5": sum(v for v in tot5 if v) if any(tot5) else None,
+            "jump_date": dates[jump] if jump is not None else None, "jump_index": jump,
+        })
+    return rows, dates
+
+
+def stock_table(store: Store, d: dt.date, constituents: list[dict]) -> str:
+    rows, dates = stock_metrics(store, d, constituents)
+    lines = ["| 代號 | 名稱 | 權重% | 收盤 | 日% | 5日% | 20日% | 60日% | 距MA20% | 距MA60% | 量/20日均量 | 距60日高% | 外資(張) | 投信(張) | 法人5日(張) |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for r in rows:
+        lots = ["" if v is None else f"{v / 1000:,.0f}" for v in (r["foreign"], r["trust"], r["tot5"])]
+        vol = "" if r["vol_ratio"] is None else f"{r['vol_ratio']:.2f}"
+        close = r["close"] if r["close"] is not None else "--"
+        lines.append(f"| {r['code']} | {r['name']} | {r['weight'] or ''} | {close} | "
+                     f"{_fmt(r['chg1'])} | {_fmt(r['r5'])} | {_fmt(r['r20'])} | {_fmt(r['r60'])} | "
+                     f"{_fmt(r['dma20'])} | {_fmt(r['dma60'])} | {vol} | {_fmt(r['dhi60'])} | "
+                     f"{lots[0]} | {lots[1]} | {lots[2]} |")
+    flagged = [f"{r['code']}（{r['jump_date']}）" for r in rows if r["jump_date"]]
     if flagged:
         lines.append("\n† 這些股票近期有超過漲跌幅的跳動（除權／分割／面額變更，價格未還原），"
                      "只用跳動之後的資料計算，空白＝資料不足：" + "、".join(flagged))
@@ -155,7 +178,9 @@ def render(store: Store, state: dict, trades: dict, panel: dict, d: dt.date, con
 
     held = set(state["positions"])
     out += ["## 重大訊息（公開資訊觀測站；每檔最多 5 則，依公告時間由新到舊，非 AI 挑選）", ""]
-    if news.get("items"):
+    if news.get("disabled"):
+        out.append("（本回測不提供重大訊息）")
+    elif news.get("items"):
         out.append(f"範圍：{news['after']} ~ {news['until']}。全宇宙只列標題；真帳持股附全文（PLAN 第 6 節）。")
         out.append("")
         for code, items in sorted(news["items"].items()):

@@ -39,6 +39,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--from", dest="start", help="replay：第一個重播日")
     ap.add_argument("--to", dest="end", help="replay：最後一個重播日")
     ap.add_argument("--model", help="decide／replay：指定模型（預設用 CLI 預設模型）")
+    ap.add_argument("--anon", type=int, metavar="SEED", help="init（試跑）：匿名化簡報，SEED＝代號亂數種子")
+    ap.add_argument("--no-news", action="store_true", help="init（試跑）：不抓重大訊息")
     ap.add_argument("--reuse-raw", help="試跑用：先讀這個帳戶資料夾的 data/raw 原始檔，沒有才連網")
     a = ap.parse_args(argv)
 
@@ -55,6 +57,14 @@ def main(argv: list[str] | None = None) -> None:
 
     if a.command == "init":
         st = daily.init(store, dt.date.fromisoformat(a.date))
+        if (a.anon is not None or a.no_news) and a.account == "live":
+            raise SystemExit("正式帳戶不准用 --anon／--no-news")
+        if a.no_news or a.anon is not None:
+            st["no_news"] = True  # 匿名回測一定不給重大訊息（內容會洩漏是哪一家）
+        if a.anon is not None:
+            from . import anon
+            anon.setup(st, a.anon)
+        store.save_state(st)
         print(f"已初始化 {store.root}：本金 {st['capital']:,}，初始化日 {st['init_date']}")
     elif a.command == "bootstrap":
         n = daily.bootstrap(store, fx, dt.date.fromisoformat(a.until), a.sessions)

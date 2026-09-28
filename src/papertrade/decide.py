@@ -19,7 +19,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import config, daily
+from . import anon, config, daily
 from .sources import Fetcher
 from .store import Store
 
@@ -71,15 +71,21 @@ def decide(store: Store, repo: Path, model: str | None = None) -> dict:
     if not day or day.get("status") != "awaiting_proposal":
         raise SystemExit("沒有等待提案的交易日（先跑 prepare）")
     session = dt.date.fromisoformat(day["date"])
-    briefing = store.briefing_path(session).read_text(encoding="utf-8")
-    prompt = build_prompt(repo, briefing)
+    bp = store.briefing_path(session)
+    if state.get("anon"):
+        bp = bp.with_name(f"{session}.anon.md")
+    prompt = build_prompt(repo, bp.read_text(encoding="utf-8"))
     out = run_claude(prompt, model)
     text = out.get("result", "")
     proposal = extract_proposal(text)
+    raw_proposal = proposal
+    if proposal is not None and state.get("anon"):
+        proposal = anon.translate(proposal, state, store, session)
     rec = {"date": session.isoformat(), "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
            "prompt_chars": len(prompt), "models": list((out.get("modelUsage") or {}).keys()),
            "cost_usd": out.get("total_cost_usd"), "seconds": out["_wall_seconds"],
-           "usage": out.get("usage"), "parsed": proposal is not None, "result": text}
+           "usage": out.get("usage"), "parsed": proposal is not None, "result": text,
+           "anon": bool(state.get("anon")), "proposal_as_written": raw_proposal}
     p = store.ledger / "ai" / f"{session}.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")

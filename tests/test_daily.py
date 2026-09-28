@@ -193,3 +193,32 @@ def test_prompt_b_skips_positions_with_formula_sell(tmp_path):
     assert missing == []
     text = store.briefing_path(D2).read_text(encoding="utf-8")
     assert "今晚必須寫的代號（0 檔）" in text and "今晚必須寫的代號（2 檔）" in text
+
+
+def test_anon_briefing_hides_identity_and_translates_back(tmp_path):
+    import re
+    from papertrade import anon
+    store, fx = setup(tmp_path, {D0: quotes(250, 250), D1: quotes(252, 255)})
+    st = store.load_state()
+    st["no_news"] = True
+    anon.setup(st, seed=7)
+    store.save_state(st)
+    daily.prepare(store, fx, dt.datetime(2026, 10, 5, 20, 0, tzinfo=TZ))
+    text = store.briefing_path(D0).with_name(f"{D0}.anon.md").read_text(encoding="utf-8")
+    for leak in PCF + ["0050 成分股（元大", "2026-", "10/05"]:
+        if leak.isdigit():
+            assert not re.search(rf"(?<![\d.]){leak}(?![\d.])", text), leak
+        else:
+            assert leak not in text, leak
+    st = store.load_state()
+    a = st["anon"]["alias"]["2317"]
+    assert a in text and "第 1 個交易日" in text
+    base = st["anon"]["base"]["2317"]
+    prop = {"date": "第 1 個交易日", "buys": [BUY | {"code": a, "target_price": 120.0, "data_as_of": "第 1 個交易日"}],
+            "panel": [{"code": a, "decision": "不賣", "reason": "x"}]}
+    real = anon.translate(prop, st, store, D0)
+    assert real["buys"][0]["code"] == "2317" and real["buys"][0]["target_price"] == round(1.2 * base, 4)
+    assert real["date"] == real["buys"][0]["data_as_of"] == D0.isoformat() and real["panel"][0]["code"] == "2317"
+    write_proposal(store, D0, **{k: v for k, v in real.items() if k != "date"})
+    r = daily.finalize(store)
+    assert [x["result"] for x in r["log"] if x["item"] == "buy"] == ["通過"]
