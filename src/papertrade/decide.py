@@ -108,6 +108,6 @@ def replay(store: Store, fx: Fetcher, repo: Path, start: dt.date, end: dt.date,
             log(f"{d} AI 失敗：{exc}（當天視為沒有提案）")
         f = daily.finalize(store)
         for row in f["log"]:
-            if row["item"] in ("buy", "no_action", "proposal") or (row["result"] == "通過" and "賣" in row["reason"]):
+            if row["item"] in ("buy", "no_action", "proposal") or (row["result"] == "通過" and row["reason"].startswith("賣")):
                 log(f"    [{row['result']}] {row['item']} {row['code']} {row['reason']}")
         d += dt.timedelta(days=1)
